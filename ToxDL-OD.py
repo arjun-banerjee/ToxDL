@@ -1,8 +1,6 @@
-
-
 from DatasetCreator import createDatasets
 from TestLauncher import runTest
-from IntegratedGradientsRunner import runFromSession
+from IntegratedGradientsRunner import runFromModel
 from PosSeqFromSaliencyMapFile import selectPosSeqFromFile
 from InterProVisualizer import runInterProVisualizer
 from SequenceShowerAA import visualizeSaliencyMapFile
@@ -10,8 +8,6 @@ import InputManager as im
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import tensorflow as tf
-import pdb
-import joblib
 import numpy as np
 
 
@@ -20,81 +16,77 @@ NETWORK_SETTINGS_FILE = 'TestFiles/000_test.test'
 
 
 def run_prediciton(testFile, predictions_save_dest = 'dl.score', save = True):
-    test_dataset = im.getSequences_without_shuffle(testFile,1,1002,silent=True)
-    
-    config = tf.ConfigProto(allow_soft_placement=True)
-    config.gpu_options.allow_growth = True
-    sess = tf.Session(config=config)
-    
-    saver = tf.train.import_meta_graph('finalmodel/test_190831-161908' +'.meta')
-    saver.restore(sess, tf.train.latest_checkpoint('finalmodel/'))
-    #saver = tf.train.import_meta_graph('/home/zzegs/workspace/dagw/toxicity_DL/rr/BASF_code/parameters/seq_model/test_190705-110204' +'.meta')
-    #saver.restore(sess, tf.train.latest_checkpoint('/home/zzegs/workspace/dagw/toxicity_DL/rr/BASF_code/parameters/seq_model/'))
-    graph = tf.get_default_graph()
-    prediction_logits = graph.get_tensor_by_name("my_logits:0")
-    X_placeholder = graph.get_tensor_by_name("X_placeholder:0")
-    Y_placeholder = graph.get_tensor_by_name("Y_placeholder:0")
-    seqlen_ph = graph.get_tensor_by_name("seqlen_placeholder:0")
-    vec_placeholder = graph.get_tensor_by_name("vec_placeholder:0")
-    
-    sigmoid_f = tf.sigmoid(prediction_logits)
-    #sess.run(output_tensor, feed_dict={.....})
+    test_dataset = im.getSequences_without_shuffle(testFile, 1, 1002, silent=True)
+
+    # Load the saved Keras model
+    model_path = 'finalmodel/test_190831-161908.keras'
+    if os.path.exists(model_path):
+        model = tf.keras.models.load_model(model_path)
+    else:
+        # Try loading weights if full model not found
+        raise FileNotFoundError(f"Model not found at {model_path}. Please ensure the model is saved in Keras format.")
+
     test_label, test_pred = [], []
     if save:
-        a = open('dl.score','w')
+        a = open('dl.score', 'w')
     batches_done = False
     while not batches_done:
         batch_x, lengths_x, batch_y, vector_x, epoch_finished = test_dataset.next_batch_without_shuffle(512)
-        sigmoids = sess.run(sigmoid_f, feed_dict={X_placeholder: batch_x, Y_placeholder: batch_y, vec_placeholder:vector_x, seqlen_ph:lengths_x})
-        for p,c in zip(sigmoids,batch_y):
+
+        # Convert to tensors
+        batch_x_t = tf.constant(batch_x, dtype=tf.int32)
+        vector_x_t = tf.constant(vector_x, dtype=tf.float32)
+        lengths_x_t = tf.constant(lengths_x, dtype=tf.int32)
+
+        # Forward pass
+        logits = model([batch_x_t, lengths_x_t, vector_x_t], training=False)
+        sigmoids = tf.nn.sigmoid(logits).numpy()
+
+        for p, c in zip(sigmoids, batch_y):
             if save:
-                print(','.join([str(x) for x in p]),file=a)
-                print(','.join([str(x) for x in c]),file=a)
-            #else:
+                print(','.join([str(x) for x in p]), file=a)
+                print(','.join([str(x) for x in c]), file=a)
             test_label.append(c[0])
             test_pred.append(p[0])
         if epoch_finished:
             batches_done = True
-    sess.close()
-    #if not save:
+
+    if save:
+        a.close()
     return np.array(test_label), np.array(test_pred)
 
-   
+
 def run_motif_scan(testFile, saliencyMapFile):
-    testset = im.getSequences(testFile,1,1002,silent=True)
-    trainset = im.getSequences('/home/zzegs/workspace/dagw/toxicity_DL/data/train_data_file.dat.domain.toxin',1,1002,silent=True)
-    
-    config = tf.ConfigProto(allow_soft_placement=True)
-    config.gpu_options.allow_growth = True
-    sess = tf.Session(config=config)
-    
-    saver = tf.train.import_meta_graph('/home/zzegs/workspace/dagw/toxicity_DL/rr/BASF_code/parameters/seq_model/test_190705-110204' +'.meta')
-    saver.restore(sess, tf.train.latest_checkpoint('/home/zzegs/workspace/dagw/toxicity_DL/rr/BASF_code/parameters/seq_model/'))
-    runFromSession(0,sess,trainset,testset,useRef=True,outF=saliencyMapFile)
-    
+    testset = im.getSequences(testFile, 1, 1002, silent=True)
+    trainset = im.getSequences('/home/zzegs/workspace/dagw/toxicity_DL/data/train_data_file.dat.domain.toxin', 1, 1002, silent=True)
+
+    # Load the saved Keras model
+    model_path = '/home/zzegs/workspace/dagw/toxicity_DL/rr/BASF_code/parameters/seq_model/test_190705-110204.keras'
+    model = tf.keras.models.load_model(model_path)
+
+    runFromModel(0, model, trainset, testset, useRef=True, outF=saliencyMapFile)
+
     fastaFile, posSaliencyFile = selectPosSeqFromFile(saliencyMapFile)
     visualizeSaliencyMapFile(posSaliencyFile, 'seq_temp')
-    sess.close()  
-    
+
+
 def run():
-    #the training, validaiton and test set
+    # the training, validation and test set
     datafiles_tuple = ('datasets/train.fa.domain.onehot', 'datasets/valid.fa.domain.onehot', 'datasets/test.fa.domain.onehot', 'toxicity.indices')
     ### train network
     print('>>> TRAINING NETWORK...')
     results = []
     for i in range(10):
-        sess, trainset, testset, auROC, auPRC, F1score, MCC = runTest(NETWORK_SETTINGS_FILE, datafiles_tuple)
-        sess.close()
-        tf.reset_default_graph()
+        model, trainset, testset, auROC, auPRC, F1score, MCC = runTest(NETWORK_SETTINGS_FILE, datafiles_tuple)
+        # Clear session between runs to free memory
+        tf.keras.backend.clear_session()
         results.append([auROC, auPRC, F1score, MCC])
     print('auROC, ', 'auPRC, ', 'F1socre, ', 'MCC')
     print(results)
     print('Mean results, auROC, auPRC, F1socre, MCC, of 10 runnning')
     print(np.mean(results, axis=0))
     ### build saliency map
-    #pdb.set_trace()
-    
-    
+
 
 if __name__ == "__main__":
     run()

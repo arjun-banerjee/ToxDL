@@ -43,36 +43,14 @@ def buildNetworkTopology(type,
                          embeddingDepth,
                          GRU_state_size):
     maxLength = maxLength - ngramsize + 1
-    X_placeholder = tf.placeholder(tf.int32, [None, maxLength],name='X_placeholder')
-    vec_placeholder = tf.placeholder(tf.float32, [None, 256],name='vec_placeholder')
-    seqlen_ph = tf.placeholder(tf.int32, [None],name='seqlen_placeholder')
-    dropout_placeholder = tf.placeholder(tf.float32,name='dropout_placeholder')
 
     if type == 'G':
-        return NetworkObject(
-                buildDeepGO(ngramsize, n_of_outputs, term_indices_file, ppi_vectors, hierarchy),
-                X_placeholder,
-                seqlen_ph,
-                vec_placeholder,
-                dropout_placeholder
-            )
+        return buildDeepGO(ngramsize, n_of_outputs, term_indices_file, ppi_vectors, hierarchy, maxLength)
     elif type in 'DKORMC':
-        return NetworkObject(
-                buildMyNetwork(type, ngramsize, n_of_outputs, term_indices_file, filterSizes, filterAmounts, maxPoolSizes, sizeOfFCLayers,
-                   dynMaxPoolSize, dropout_placeholder, ppi_vectors, hierarchy, embeddingDepth, embeddingType, GRU_state_size),
-                X_placeholder,
-                seqlen_ph,
-                vec_placeholder,
-                dropout_placeholder
-            )
+        return buildMyNetwork(type, ngramsize, n_of_outputs, term_indices_file, filterSizes, filterAmounts, maxPoolSizes, sizeOfFCLayers,
+                   dynMaxPoolSize, ppi_vectors, hierarchy, embeddingDepth, embeddingType, GRU_state_size, maxLength)
     elif type == 'P':
-        return NetworkObject(
-                buildPPIOnlyNetwork(n_of_outputs, term_indices_file, sizeOfFCLayers, hierarchy),
-                X_placeholder,
-                seqlen_ph,
-                vec_placeholder,
-                dropout_placeholder
-            )
+        return buildPPIOnlyNetwork(n_of_outputs, term_indices_file, sizeOfFCLayers, hierarchy, maxLength)
     else:
         return AssertionError('Type {} not supported'.format(type))
 
@@ -95,274 +73,348 @@ def printNeuralNet(layers):
 #######################################################################################################
 
 # Returns the DeepGO model. Explanation of the parameters can be found on top of this file
-def buildDeepGO(ngramsize, n_of_outputs, term_indices_file, ppi_vectors, hierarchy):
+def buildDeepGO(ngramsize, n_of_outputs, term_indices_file, ppi_vectors, hierarchy, maxLength):
     assert ngramsize == 3
-    def network(X, seqlens, vec):
-        layers = []
-        model = np.random.uniform(-0.05,0.05,(20**ngramsize+1,128))
-        model = np.asarray(model,dtype=np.float32)
-        model[0][:] = 0.0
-        model = tf.Variable(model,trainable=True)
-        l = tf.nn.embedding_lookup(model,X,name='embedding_out')
-        layers.append(l)
-        layers.append(tf.layers.dropout(layers[-1], 0.2))
 
-        layers.append(tf.layers.conv1d(layers[-1],32,128,padding='valid',activation=tf.nn.relu))
-        layers.append(tf.layers.max_pooling1d(layers[-1], 64, 32))
-        layers.append(tf.contrib.layers.flatten(layers[-1]))
+    # Define inputs
+    X_input = tf.keras.Input(shape=(maxLength,), dtype=tf.int32, name='X_placeholder')
+    seqlen_input = tf.keras.Input(shape=(), dtype=tf.int32, name='seqlen_placeholder')
+    vec_input = tf.keras.Input(shape=(256,), dtype=tf.float32, name='vec_placeholder')
 
-        if ppi_vectors:
-            layers.append(tf.concat([layers[-1],vec],axis=1)) ###
+    # Embedding layer
+    vocab_size = 20**ngramsize + 1
+    embedding_init = tf.keras.initializers.RandomUniform(-0.05, 0.05)
+    embedding_layer = tf.keras.layers.Embedding(
+        input_dim=vocab_size,
+        output_dim=128,
+        embeddings_initializer=embedding_init,
+        trainable=True,
+        mask_zero=True,
+        name='embedding_out'
+    )
 
-        logits = []
-        output_layers = [None] * n_of_outputs
-        if not hierarchy:
-            for i in range(n_of_outputs):
-                l1 = tf.layers.dense(layers[-1],256,activation=tf.nn.relu,name='term{}-1'.format(i))
-                l2 = tf.layers.dense(l1,1,name='term{}-2'.format(i))
-                logits.append(l2)
-                output_layers[i] = l2
-        else:
-            dependencies = gogb.build_graph(term_indices_file)
-            fc_layers = {}
-            # get all top terms (without parents)
-            terms_without_any_more_parents = [term for term in dependencies if not any(1 for parent in dependencies if parent in dependencies[term])]
-            # as long as we have more terms without any more parents, loop
-            ctr = 0
-            while terms_without_any_more_parents:
-                ctr+=1
-                # create fully-connected layer using the layers[-1] and FC of previous parents
-                this_term = terms_without_any_more_parents.pop(0)                                       # get a new term to add
-                parents = dependencies[this_term]                                                       # get the parents of this term
-                children = list({key for key in dependencies if this_term in dependencies[key]}) # get the children of this term
-                prev_l = tf.concat([layers[-1]]+[fc_layers[parent] for parent in parents],axis=1)       # create a FC layer based on the network output + parent fc outputs
-                l1 = tf.layers.dense(prev_l, 256, activation=tf.nn.relu,name='term{}-1'.format(this_term))
-                fc_layers[this_term] = l1                                                               # add this FC layer to fc_layers
-                l2 = tf.layers.dense(l1, 1, name='term{}-2'.format(this_term))                          # create the logit neuron and add to logits and output_layers
-                logits.append(l2)
-                output_layers[this_term] = l2
+    layers = []
+    l = embedding_layer(X_input)
+    layers.append(l)
+    layers.append(tf.keras.layers.Dropout(0.2)(layers[-1]))
 
-                set_of_added_terms = set(terms_without_any_more_parents + list(fc_layers.keys()))       # create a set of all terms that have a FC already
-                # check for each child if it is eligible --- i.e. if all of its parents have been covered already
-                terms_without_any_more_parents.extend([child for child in children if
-                                                                        all(term in set_of_added_terms for term in dependencies[child]) and
-                                                                        child not in set_of_added_terms
-                                                                        ])
+    layers.append(tf.keras.layers.Conv1D(32, 128, padding='valid', activation='relu')(layers[-1]))
+    layers.append(tf.keras.layers.MaxPooling1D(64, 32)(layers[-1]))
+    layers.append(tf.keras.layers.Flatten()(layers[-1]))
 
-            for term in range(n_of_outputs):
-                children_terms = list({key for key in dependencies if term in dependencies[key]})
-                if len(children_terms) == 0:
-                    output_layers[term] = logits[term]
-                else:
-                    all_chldrn_l = tf.concat([logits[x] for x in [term]+children_terms],axis=1)
-                    mx_l = tf.reduce_max(all_chldrn_l,axis=1,keepdims=True,name='term{}-3'.format(term))
-                    output_layers[term] = mx_l
+    if ppi_vectors:
+        layers.append(tf.keras.layers.Concatenate()([layers[-1], vec_input]))
 
-        printNeuralNet(layers)
-        print('And then some output layers... ({})\n'.format(len(output_layers)))
+    logits = []
+    output_layers = [None] * n_of_outputs
+    if not hierarchy:
+        for i in range(n_of_outputs):
+            l1 = tf.keras.layers.Dense(256, activation='relu', name='term{}-1'.format(i))(layers[-1])
+            l2 = tf.keras.layers.Dense(1, name='term{}-2'.format(i))(l1)
+            logits.append(l2)
+            output_layers[i] = l2
+    else:
+        dependencies = gogb.build_graph(term_indices_file)
+        fc_layers = {}
+        # get all top terms (without parents)
+        terms_without_any_more_parents = [term for term in dependencies if not any(1 for parent in dependencies if parent in dependencies[term])]
+        # as long as we have more terms without any more parents, loop
+        ctr = 0
+        while terms_without_any_more_parents:
+            ctr+=1
+            # create fully-connected layer using the layers[-1] and FC of previous parents
+            this_term = terms_without_any_more_parents.pop(0)                                       # get a new term to add
+            parents = dependencies[this_term]                                                       # get the parents of this term
+            children = list({key for key in dependencies if this_term in dependencies[key]}) # get the children of this term
+            if parents:
+                prev_l = tf.keras.layers.Concatenate()([layers[-1]]+[fc_layers[parent] for parent in parents])
+            else:
+                prev_l = layers[-1]
+            l1 = tf.keras.layers.Dense(256, activation='relu', name='term{}-1'.format(this_term))(prev_l)
+            fc_layers[this_term] = l1                                                               # add this FC layer to fc_layers
+            l2 = tf.keras.layers.Dense(1, name='term{}-2'.format(this_term))(l1)                    # create the logit neuron and add to logits and output_layers
+            logits.append(l2)
+            output_layers[this_term] = l2
 
-        # The output layer here is returned as logits. Sigmoids are added in the TrainingProcedure.py file
-        cc = tf.concat(output_layers,axis=1,name='my_logits')
-        print('{:35s} -> {}'.format(cc.name, cc.shape))
-        return cc
+            set_of_added_terms = set(terms_without_any_more_parents + list(fc_layers.keys()))       # create a set of all terms that have a FC already
+            # check for each child if it is eligible --- i.e. if all of its parents have been covered already
+            terms_without_any_more_parents.extend([child for child in children if
+                                                                    all(term in set_of_added_terms for term in dependencies[child]) and
+                                                                    child not in set_of_added_terms
+                                                                    ])
 
-    return network
+        for term in range(n_of_outputs):
+            children_terms = list({key for key in dependencies if term in dependencies[key]})
+            if len(children_terms) == 0:
+                output_layers[term] = logits[term]
+            else:
+                all_chldrn_l = tf.keras.layers.Concatenate()([logits[x] for x in [term]+children_terms])
+                mx_l = tf.keras.layers.Lambda(lambda x: tf.reduce_max(x, axis=1, keepdims=True), name='term{}-3'.format(term))(all_chldrn_l)
+                output_layers[term] = mx_l
+
+    printNeuralNet(layers)
+    print('And then some output layers... ({})\n'.format(len(output_layers)))
+
+    # The output layer here is returned as logits. Sigmoids are added in the TrainingProcedure.py file
+    cc = tf.keras.layers.Concatenate(name='my_logits')(output_layers)
+    print('{:35s} -> {}'.format(cc.name, cc.shape))
+
+    # Create model
+    model = tf.keras.Model(inputs=[X_input, seqlen_input, vec_input], outputs=cc, name='deepgo_model')
+    return NetworkObject(model, X_input, seqlen_input, vec_input)
+
 
 # Returns one of our models, according to the parameters. Explanation of the parameters can be found on top of this file
 def buildMyNetwork(type, ngramsize, n_of_outputs, term_indices_file, filterSizes, filterAmounts, maxPoolSizes, sizeOfFCLayers,
-                   dynMaxPoolSize, dropout_placeholder, ppi_vectors, hierarchy, embeddingDepth, embeddingType, GRU_state_size):
-    def network(X, seqlens, vec):
-        layers = []
+                   dynMaxPoolSize, ppi_vectors, hierarchy, embeddingDepth, embeddingType, GRU_state_size, maxLength):
 
-        ### Embedding layer ###
-        if embeddingType == 'onehot':
-            model = np.zeros((20**ngramsize+1,20**ngramsize),dtype=np.float32)
-            for i in range(20**ngramsize): model[i+1][i] = 1
-        elif embeddingType == 'trainable':
-            model = np.random.uniform(-0.05, 0.05, (20 ** ngramsize + 1, embeddingDepth))
-            model = np.asarray(model, dtype=np.float32)
-            model[0][:] = 0.0
-            model = tf.Variable(model, trainable=True)
-        else:
-            raise AssertionError('embeddingType {embeddingType} unknown')
+    # Define inputs
+    X_input = tf.keras.Input(shape=(maxLength,), dtype=tf.int32, name='X_placeholder')
+    seqlen_input = tf.keras.Input(shape=(), dtype=tf.int32, name='seqlen_placeholder')
+    vec_input = tf.keras.Input(shape=(256,), dtype=tf.float32, name='vec_placeholder')
 
-        l = tf.nn.embedding_lookup(model,X,name='embedding_out')
-        layers.append(l)
+    layers = []
+    vocab_size = 20**ngramsize + 1
 
-        ### Convolutional, dropout and maxpool layers ###
-        for f_size, f_amount, p_size in zip(filterSizes,filterAmounts,maxPoolSizes):
-            layers.append(tf.layers.conv1d(layers[-1],f_amount,f_size,padding='same',activation=tf.nn.relu))
-            layers.append(tf.layers.dropout(layers[-1], dropout_placeholder))
-            layers.append(tf.layers.max_pooling1d(layers[-1], p_size, p_size))
-            seqlens = seqlens // p_size
-        print(seqlens)
-        ### Varying input strategy, depending on the type ###
-        if type == 'D':
-            layers.append(dynamic_max_pooling_with_overlapping_windows(layers[-1],seqlens,fixed_output_size=dynMaxPoolSize))
-        elif type == 'K':
-            layers.append(tf.transpose(layers[-1], perm=[0, 2, 1]))
-            values, _indices = tf.nn.top_k(layers[-1], k=dynMaxPoolSize, sorted=False)
-            layers.append(values)
-        elif type == 'O':
-            pass #do nothing special
-        elif type == 'R':
-            layers.append(BidirectionalGRULayer(layers[-1], seqlens, GRU_state_size))
-        elif type == 'M':
-            layers.append(tf.layers.max_pooling1d(layers[-1], int(layers[-1].shape[1]), int(layers[-1].shape[1])))
-        elif type == 'C':
-            D_layer = dynamic_max_pooling_with_overlapping_windows(layers[-1],seqlens,fixed_output_size=dynMaxPoolSize)
-            K_layer_pre = tf.transpose(layers[-1], perm=[0, 2, 1])
-            K_layer, _indices = tf.nn.top_k(K_layer_pre, k=dynMaxPoolSize, sorted=False)
-            K_layer_T = tf.transpose(K_layer, perm=[0, 2, 1])
-            layers.append(D_layer)
-            layers.append(K_layer_T)
-            layers.append(tf.concat([D_layer,K_layer_T],axis=1))
-        layers.append(tf.contrib.layers.flatten(layers[-1]))
+    ### Embedding layer ###
+    if embeddingType == 'onehot':
+        # Create one-hot embedding matrix
+        onehot_matrix = np.zeros((vocab_size, 20**ngramsize), dtype=np.float32)
+        for i in range(20**ngramsize):
+            onehot_matrix[i+1][i] = 1
+        embedding_init = tf.keras.initializers.Constant(onehot_matrix)
+        embedding_layer = tf.keras.layers.Embedding(
+            input_dim=vocab_size,
+            output_dim=20**ngramsize,
+            embeddings_initializer=embedding_init,
+            trainable=False,
+            mask_zero=False,
+            name='embedding_out'
+        )
+    elif embeddingType == 'trainable':
+        embedding_init = tf.keras.initializers.RandomUniform(-0.05, 0.05)
+        embedding_layer = tf.keras.layers.Embedding(
+            input_dim=vocab_size,
+            output_dim=embeddingDepth,
+            embeddings_initializer=embedding_init,
+            trainable=True,
+            mask_zero=True,
+            name='embedding_out'
+        )
+    else:
+        raise AssertionError(f'embeddingType {embeddingType} unknown')
 
-        ### Concatenate domain vectors if specified ###
-        if ppi_vectors:
-            layers.append(tf.concat([layers[-1],vec],axis=1))
+    l = embedding_layer(X_input)
+    layers.append(l)
 
-        ### Build output layers ###
-        logits = []
-        output_layers = [None] * n_of_outputs
-        if not hierarchy:
-            for i in range(n_of_outputs):
-                l1 = tf.layers.dense(layers[-1],sizeOfFCLayers,activation=tf.nn.relu,name='term{}-1'.format(i))
-                l2 = tf.layers.dense(l1,1,name='term{}-2'.format(i))
-                logits.append(l2)
-                output_layers[i] = l2
-        else:
-            dependencies = gogb.build_graph(term_indices_file)
-            fc_layers = {}
-            # get all top terms (without parents)
-            terms_without_any_more_parents = [term for term in dependencies if not any(1 for parent in dependencies if parent in dependencies[term])]
-            # as long as we have more terms without any more parents, loop
-            ctr = 0
-            while terms_without_any_more_parents:
-                ctr+=1
-                # create fully-connected layer using the layers[-1] and FC of previous parents
-                this_term = terms_without_any_more_parents.pop(0)                                       # get a new term to add
-                parents = dependencies[this_term]                                                       # get the parents of this term
-                children = list({key for key in dependencies if this_term in dependencies[key]})        # get the children of this term
-                prev_l = tf.concat([layers[-1]]+[fc_layers[parent] for parent in parents],axis=1)       # create a FC layer based on the network output + parent fc outputs
-                l1 = tf.layers.dense(prev_l, sizeOfFCLayers, activation=tf.nn.relu,name='term{}-1'.format(this_term))
-                fc_layers[this_term] = l1                                                               # add this FC layer to fc_layers
-                l2 = tf.layers.dense(l1, 1, name='term{}-2'.format(this_term))                          # create the logit neuron and add to logits and output_layers
-                logits.append(l2)
-                output_layers[this_term] = l2
+    # Track sequence lengths through pooling
+    seqlens = seqlen_input
 
-                set_of_added_terms = set(terms_without_any_more_parents + list(fc_layers.keys()))       # create a set of all terms that have a FC already
-                # check for each child if it is eligible --- i.e. if all of its parents have been covered already
-                terms_without_any_more_parents.extend([child for child in children if
-                                                                        all(term in set_of_added_terms for term in dependencies[child]) and
-                                                                        child not in set_of_added_terms
-                                                                        ])
+    ### Convolutional, dropout and maxpool layers ###
+    for idx, (f_size, f_amount, p_size) in enumerate(zip(filterSizes, filterAmounts, maxPoolSizes)):
+        layers.append(tf.keras.layers.Conv1D(f_amount, f_size, padding='same', activation='relu')(layers[-1]))
+        layers.append(tf.keras.layers.Dropout(0.2)(layers[-1]))  # Dropout rate will be controlled by training flag
+        layers.append(tf.keras.layers.MaxPooling1D(p_size, p_size)(layers[-1]))
+        seqlens = seqlens // p_size
+    print(seqlens)
 
-            for term in range(n_of_outputs):
-                children_terms = list({key for key in dependencies if term in dependencies[key]})
-                if len(children_terms) == 0:
-                    output_layers[term] = logits[term]
-                else:
-                    all_chldrn_l = tf.concat([logits[x] for x in [term]+children_terms],axis=1)
-                    mx_l = tf.reduce_max(all_chldrn_l,axis=1,keepdims=True,name='term{}-3'.format(term))
-                    output_layers[term] = mx_l
+    ### Varying input strategy, depending on the type ###
+    if type == 'D':
+        # Dynamic max pooling - need to use Lambda layer for custom operation
+        layers.append(tf.keras.layers.Lambda(
+            lambda x: dynamic_max_pooling_with_overlapping_windows(x[0], x[1], fixed_output_size=dynMaxPoolSize),
+            name='dynamic_max_pool'
+        )([layers[-1], seqlens]))
+    elif type == 'K':
+        layers.append(tf.keras.layers.Permute((2, 1))(layers[-1]))
+        layers.append(tf.keras.layers.Lambda(
+            lambda x: tf.nn.top_k(x, k=dynMaxPoolSize, sorted=False)[0],
+            name='k_max_pool'
+        )(layers[-1]))
+    elif type == 'O':
+        pass  # do nothing special
+    elif type == 'R':
+        layers.append(tf.keras.layers.Lambda(
+            lambda x: BidirectionalGRULayer(x[0], x[1], GRU_state_size),
+            name='bidirectional_gru'
+        )([layers[-1], seqlens]))
+    elif type == 'M':
+        pool_size = int(layers[-1].shape[1])
+        layers.append(tf.keras.layers.MaxPooling1D(pool_size, pool_size)(layers[-1]))
+    elif type == 'C':
+        # Combined D+K
+        D_layer = tf.keras.layers.Lambda(
+            lambda x: dynamic_max_pooling_with_overlapping_windows(x[0], x[1], fixed_output_size=dynMaxPoolSize),
+            name='dynamic_max_pool_c'
+        )([layers[-1], seqlens])
+        K_layer_pre = tf.keras.layers.Permute((2, 1))(layers[-1])
+        K_layer = tf.keras.layers.Lambda(
+            lambda x: tf.nn.top_k(x, k=dynMaxPoolSize, sorted=False)[0],
+            name='k_max_pool_c'
+        )(K_layer_pre)
+        K_layer_T = tf.keras.layers.Permute((2, 1))(K_layer)
+        layers.append(D_layer)
+        layers.append(K_layer_T)
+        layers.append(tf.keras.layers.Concatenate(axis=1)([D_layer, K_layer_T]))
 
-        printNeuralNet(layers)
-        print('And then some output layers... ({})\n'.format(len(output_layers)))
+    layers.append(tf.keras.layers.Flatten()(layers[-1]))
 
-        # The output layer here is returned as logits. Sigmoids are added in the TrainingProcedure.py file
-        cc = tf.concat(output_layers,axis=1,name='my_logits')
-        print('{:35s} -> {}'.format(cc.name, cc.shape))
-        return cc
+    ### Concatenate domain vectors if specified ###
+    if ppi_vectors:
+        layers.append(tf.keras.layers.Concatenate()([layers[-1], vec_input]))
 
-    return network
+    ### Build output layers ###
+    logits = []
+    output_layers = [None] * n_of_outputs
+    if not hierarchy:
+        for i in range(n_of_outputs):
+            l1 = tf.keras.layers.Dense(sizeOfFCLayers, activation='relu', name='term{}-1'.format(i))(layers[-1])
+            l2 = tf.keras.layers.Dense(1, name='term{}-2'.format(i))(l1)
+            logits.append(l2)
+            output_layers[i] = l2
+    else:
+        dependencies = gogb.build_graph(term_indices_file)
+        fc_layers = {}
+        # get all top terms (without parents)
+        terms_without_any_more_parents = [term for term in dependencies if not any(1 for parent in dependencies if parent in dependencies[term])]
+        # as long as we have more terms without any more parents, loop
+        ctr = 0
+        while terms_without_any_more_parents:
+            ctr+=1
+            # create fully-connected layer using the layers[-1] and FC of previous parents
+            this_term = terms_without_any_more_parents.pop(0)                                       # get a new term to add
+            parents = dependencies[this_term]                                                       # get the parents of this term
+            children = list({key for key in dependencies if this_term in dependencies[key]})        # get the children of this term
+            if parents:
+                prev_l = tf.keras.layers.Concatenate()([layers[-1]]+[fc_layers[parent] for parent in parents])
+            else:
+                prev_l = layers[-1]
+            l1 = tf.keras.layers.Dense(sizeOfFCLayers, activation='relu', name='term{}-1'.format(this_term))(prev_l)
+            fc_layers[this_term] = l1                                                               # add this FC layer to fc_layers
+            l2 = tf.keras.layers.Dense(1, name='term{}-2'.format(this_term))(l1)                    # create the logit neuron and add to logits and output_layers
+            logits.append(l2)
+            output_layers[this_term] = l2
 
-def buildPPIOnlyNetwork(n_of_outputs, term_indices_file, sizeOfFCLayers, hierarchy):
-    def network(X, seqlens, vec):
-        layers = []
-        layers.append(tf.layers.dense(vec,sizeOfFCLayers,activation=tf.nn.relu)) ###
+            set_of_added_terms = set(terms_without_any_more_parents + list(fc_layers.keys()))       # create a set of all terms that have a FC already
+            # check for each child if it is eligible --- i.e. if all of its parents have been covered already
+            terms_without_any_more_parents.extend([child for child in children if
+                                                                    all(term in set_of_added_terms for term in dependencies[child]) and
+                                                                    child not in set_of_added_terms
+                                                                    ])
 
-        #for n_neurons in sizeOfFCLayers[1:]:
-        #    layers.append(tf.layers.dense(layers[-1],n_neurons,activation=tf.nn.relu)) ###
-        logits = []
-        output_layers = [None] * n_of_outputs
+        for term in range(n_of_outputs):
+            children_terms = list({key for key in dependencies if term in dependencies[key]})
+            if len(children_terms) == 0:
+                output_layers[term] = logits[term]
+            else:
+                all_chldrn_l = tf.keras.layers.Concatenate()([logits[x] for x in [term]+children_terms])
+                mx_l = tf.keras.layers.Lambda(lambda x: tf.reduce_max(x, axis=1, keepdims=True), name='term{}-3'.format(term))(all_chldrn_l)
+                output_layers[term] = mx_l
 
-        if not hierarchy:
-            for i in range(n_of_outputs):
-                l1 = tf.layers.dense(layers[-1],64,activation=tf.nn.relu,name='term{}-1'.format(i))
-                l2 = tf.layers.dense(l1,1,name='term{}-2'.format(i))
-                logits.append(l2)
-                output_layers[i] = l2
-        else:
-            dependencies = gogb.build_graph(term_indices_file)
-            fc_layers = {}
-            # get all top terms (without parents)
-            terms_without_any_more_parents = [term for term in dependencies if not any(1 for parent in dependencies if parent in dependencies[term])]
-            # as long as we have more terms without any more parents, loop
-            ctr = 0
-            while terms_without_any_more_parents:
-                ctr+=1
-                # create fully-connected layer using the layers[-1] and FC of previous parents
-                this_term = terms_without_any_more_parents.pop(0)                                       # get a new term to add
-                parents = dependencies[this_term]                                                       # get the parents of this term
-                children = list({key for key in dependencies if this_term in dependencies[key]}) # get the children of this term
-                prev_l = tf.concat([layers[-1]]+[fc_layers[parent] for parent in parents],axis=1)       # create a FC layer based on the network output + parent fc outputs
-                l1 = tf.layers.dense(prev_l, 64, activation=tf.nn.relu,name='term{}-1'.format(this_term))
-                fc_layers[this_term] = l1                                                               # add this FC layer to fc_layers
-                l2 = tf.layers.dense(l1, 1, name='term{}-2'.format(this_term))                          # create the logit neuron and add to logits and output_layers
-                logits.append(l2)
-                output_layers[this_term] = l2
+    printNeuralNet(layers)
+    print('And then some output layers... ({})\n'.format(len(output_layers)))
 
-                set_of_added_terms = set(terms_without_any_more_parents + list(fc_layers.keys()))       # create a set of all terms that have a FC already
-                # check for each child if it is eligible --- i.e. if all of its parents have been covered already
-                terms_without_any_more_parents.extend([child for child in children if
-                                                                        all(term in set_of_added_terms for term in dependencies[child]) and
-                                                                        child not in set_of_added_terms
-                                                                        ])
+    # The output layer here is returned as logits. Sigmoids are added in the TrainingProcedure.py file
+    cc = tf.keras.layers.Concatenate(name='my_logits')(output_layers)
+    print('{:35s} -> {}'.format(cc.name, cc.shape))
 
-            for term in range(n_of_outputs):
-                children_terms = list({key for key in dependencies if term in dependencies[key]})
-                if len(children_terms) == 0:
-                    output_layers[term] = logits[term]
-                else:
-                    all_chldrn_l = tf.concat([logits[x] for x in [term]+children_terms],axis=1)
-                    mx_l = tf.reduce_max(all_chldrn_l,axis=1,keepdims=True,name='term{}-4'.format(term))
-                    output_layers[term] = mx_l
-
-        printNeuralNet(layers)
-        print('And then some output layers... ({})\n'.format(len(output_layers)))
-
-        # The output layer here is returned as logits. Sigmoids are added in the TrainingProcedure.py file
-        cc = tf.concat(output_layers,axis=1,name='my_logits')
-        print('{:35s} -> {}'.format(cc.name, cc.shape))
-        return cc
-
-    return network
+    # Create model
+    model = tf.keras.Model(inputs=[X_input, seqlen_input, vec_input], outputs=cc, name='my_network_model')
+    return NetworkObject(model, X_input, seqlen_input, vec_input)
 
 
-# Objects of this class hold a neural network tensor, as well as the placeholders used in that network
+def buildPPIOnlyNetwork(n_of_outputs, term_indices_file, sizeOfFCLayers, hierarchy, maxLength):
+    # Define inputs
+    X_input = tf.keras.Input(shape=(maxLength,), dtype=tf.int32, name='X_placeholder')
+    seqlen_input = tf.keras.Input(shape=(), dtype=tf.int32, name='seqlen_placeholder')
+    vec_input = tf.keras.Input(shape=(256,), dtype=tf.float32, name='vec_placeholder')
+
+    layers = []
+    layers.append(tf.keras.layers.Dense(sizeOfFCLayers, activation='relu')(vec_input))
+
+    logits = []
+    output_layers = [None] * n_of_outputs
+
+    if not hierarchy:
+        for i in range(n_of_outputs):
+            l1 = tf.keras.layers.Dense(64, activation='relu', name='term{}-1'.format(i))(layers[-1])
+            l2 = tf.keras.layers.Dense(1, name='term{}-2'.format(i))(l1)
+            logits.append(l2)
+            output_layers[i] = l2
+    else:
+        dependencies = gogb.build_graph(term_indices_file)
+        fc_layers = {}
+        # get all top terms (without parents)
+        terms_without_any_more_parents = [term for term in dependencies if not any(1 for parent in dependencies if parent in dependencies[term])]
+        # as long as we have more terms without any more parents, loop
+        ctr = 0
+        while terms_without_any_more_parents:
+            ctr+=1
+            # create fully-connected layer using the layers[-1] and FC of previous parents
+            this_term = terms_without_any_more_parents.pop(0)                                       # get a new term to add
+            parents = dependencies[this_term]                                                       # get the parents of this term
+            children = list({key for key in dependencies if this_term in dependencies[key]}) # get the children of this term
+            if parents:
+                prev_l = tf.keras.layers.Concatenate()([layers[-1]]+[fc_layers[parent] for parent in parents])
+            else:
+                prev_l = layers[-1]
+            l1 = tf.keras.layers.Dense(64, activation='relu', name='term{}-1'.format(this_term))(prev_l)
+            fc_layers[this_term] = l1                                                               # add this FC layer to fc_layers
+            l2 = tf.keras.layers.Dense(1, name='term{}-2'.format(this_term))(l1)                    # create the logit neuron and add to logits and output_layers
+            logits.append(l2)
+            output_layers[this_term] = l2
+
+            set_of_added_terms = set(terms_without_any_more_parents + list(fc_layers.keys()))       # create a set of all terms that have a FC already
+            # check for each child if it is eligible --- i.e. if all of its parents have been covered already
+            terms_without_any_more_parents.extend([child for child in children if
+                                                                    all(term in set_of_added_terms for term in dependencies[child]) and
+                                                                    child not in set_of_added_terms
+                                                                    ])
+
+        for term in range(n_of_outputs):
+            children_terms = list({key for key in dependencies if term in dependencies[key]})
+            if len(children_terms) == 0:
+                output_layers[term] = logits[term]
+            else:
+                all_chldrn_l = tf.keras.layers.Concatenate()([logits[x] for x in [term]+children_terms])
+                mx_l = tf.keras.layers.Lambda(lambda x: tf.reduce_max(x, axis=1, keepdims=True), name='term{}-4'.format(term))(all_chldrn_l)
+                output_layers[term] = mx_l
+
+    printNeuralNet(layers)
+    print('And then some output layers... ({})\n'.format(len(output_layers)))
+
+    # The output layer here is returned as logits. Sigmoids are added in the TrainingProcedure.py file
+    cc = tf.keras.layers.Concatenate(name='my_logits')(output_layers)
+    print('{:35s} -> {}'.format(cc.name, cc.shape))
+
+    # Create model
+    model = tf.keras.Model(inputs=[X_input, seqlen_input, vec_input], outputs=cc, name='ppi_only_model')
+    return NetworkObject(model, X_input, seqlen_input, vec_input)
+
+
+# Objects of this class hold a Keras model, as well as the input layers used in that model
 class NetworkObject:
-    def __init__(self, network, X_placeholder, seqlen_ph, vec_placeholder, dropoutPlaceholder):
-        self.network = network
-        self.X_placeholder = X_placeholder
-        self.seqlen_ph = seqlen_ph
-        self.vec_placeholder = vec_placeholder
-        self.dropoutPlaceholder = dropoutPlaceholder
+    def __init__(self, model, X_input, seqlen_input, vec_input):
+        self.model = model
+        self.X_input = X_input
+        self.seqlen_input = seqlen_input
+        self.vec_input = vec_input
+
+    def getModel(self):
+        return self.model
 
     def getNetwork(self):
-        return self.network
+        """Legacy method - returns a callable that mimics the old function-based network"""
+        return lambda X, seqlens, vec: self.model([X, seqlens, vec])
 
     def getSeqLenPlaceholder(self):
-        return self.seqlen_ph
+        return self.seqlen_input
 
     def get_X_placeholder(self):
-        return self.X_placeholder
+        return self.X_input
 
     def get_vec_placeholder(self):
-        return self.vec_placeholder
+        return self.vec_input
 
-    def getDropoutPlaceholder(self):
-        return self.dropoutPlaceholder
-
-
+    def __call__(self, inputs, training=False):
+        return self.model(inputs, training=training)
